@@ -93,9 +93,6 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result['finish'], 'stop')
         self.assertEqual(len(post.call_args.args[2]['messages'][-1]['content']), 2)
 
-if __name__ == '__main__':
-    unittest.main()
-
 class FullTrajectoryTests(unittest.TestCase):
     def test_two_tools_and_final_with_real_snapshot(self):
         class ScenarioProvider:
@@ -125,3 +122,48 @@ class FullTrajectoryTests(unittest.TestCase):
                 self.assertEqual(result['finish'], 'stop')
                 self.assertEqual(post.call_args.args[2]['model'], 'test-model')
                 self.assertIn('chat/completions', post.call_args.args[0])
+
+class OpenCodeProviderTests(unittest.TestCase):
+    @patch.dict('os.environ', {'OPENCODE_GO_API_KEY': 'test-key'})
+    @patch('providers.post_json')
+    def test_session_stays_stable_within_run_and_is_unique_per_provider(self, post):
+        post.return_value = {'choices':[{'message':{'role':'assistant','content':'ok'},'finish_reason':'stop'}]}
+        client = Provider('opencode-go','deepseek-v4.1-flash')
+        for _ in range(2):
+            client.complete([{'role':'user','content':'hello'}], [])
+        first, second = [call.args for call in post.call_args_list]
+        self.assertEqual(first[1]['x-opencode-session'],second[1]['x-opencode-session'])
+        self.assertTrue(first[1]['User-Agent'].startswith('StatusAgentLab/'))
+        self.assertIn('/inference/go/openai/v1/chat/completions', first[0])
+        self.assertNotEqual(client.session_id,Provider('opencode-go','deepseek-v4.1-flash').session_id)
+
+    @patch.dict('os.environ', {'OPENCODE_GO_API_KEY': 'test-key'})
+    @patch('providers.post_json')
+    def test_preserves_raw_assistant_message_for_tool_round_trip(self, post):
+        raw = {'role':'assistant','content':None,'reasoning_content':'internal', 'tool_calls':[{'id':'x','type':'function','function':{'name':'get_status','arguments':'{"provider":"github"}'}}]}
+        post.return_value = {'choices':[{'message':raw,'finish_reason':'tool_calls'}]}
+        p = Provider('opencode-go','deepseek-v4.1-flash')
+        response = p.complete([{'role':'user','content':'x'}], [])
+        self.assertEqual(response['message'],raw)
+        self.assertEqual(response['calls'][0]['id'],'x')
+
+    @patch.dict('os.environ', {'OPENCODE_GO_API_KEY': 'test-key'})
+    @patch('providers.post_json')
+    def test_agent_tool_round_trip_reuses_session(self, post):
+        call = {'id':'call1','type':'function','function':{'name':'get_status','arguments':'{"provider":"github"}'}}
+        post.side_effect = [
+            {'choices':[{'message':{'role':'assistant','content':None,'reasoning_content':'internal','tool_calls':[call]},'finish_reason':'tool_calls'}]},
+            {'choices':[{'message':{'role':'assistant','content':'GitHub status received'},'finish_reason':'stop'}]},
+        ]
+        result = run_agent('Check GitHub',Provider('opencode-go','deepseek-v4.1-flash'),StatusTools())
+        self.assertEqual(result['status'],'completed')
+        first, second = [x.args for x in post.call_args_list]
+        self.assertEqual(first[1]['x-opencode-session'],second[1]['x-opencode-session'])
+        messages = second[2]['messages']
+        assistant = next(m for m in messages if m.get('tool_calls'))
+        tool = next(m for m in messages if m.get('role') == 'tool')
+        self.assertEqual(assistant['reasoning_content'],'internal')
+        self.assertEqual(tool['tool_call_id'],'call1')
+
+if __name__ == '__main__':
+    unittest.main()
